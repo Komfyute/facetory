@@ -1,19 +1,501 @@
 <!doctype html>
-<html lang="en">
-	<head>
-		<meta charset="UTF-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<title>Hello, World!</title>
-	</head>
-	<body>
-		<h1 id="heading"></h1>
-		<script>
-			fetch('/message')
-				.then((resp) => resp.text())
-				.then((text) => {
-					const h1 = document.getElementById('heading');
-					h1.textContent = text;
-				});
-		</script>
-	</body>
+<html lang="ko">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>얼굴 간단 분석</title>
+        <style>
+            body {
+                max-width: 760px;
+                margin: 32px auto;
+                padding: 0 16px;
+                font-family: system-ui, sans-serif;
+                color: #202124;
+                background: #f7f8fa;
+            }
+            h1 {
+                font-size: 1.5rem;
+            }
+            .controls,
+            .panel {
+                margin: 16px 0;
+                padding: 16px;
+                background: white;
+                border: 1px solid #ddd;
+                border-radius: 12px;
+            }
+            button,
+            input::file-selector-button {
+                margin: 4px;
+                padding: 9px 13px;
+                border: 1px solid #bbb;
+                border-radius: 8px;
+                background: white;
+                cursor: pointer;
+            }
+            button:disabled {
+                opacity: 0.5;
+                cursor: wait;
+            }
+            #status {
+                min-height: 1.5em;
+                color: #444;
+            }
+            canvas {
+                display: block;
+                max-width: 100%;
+                height: auto;
+                margin: 12px auto;
+                border-radius: 8px;
+                background: #eee;
+            }
+            .note {
+                color: #666;
+                font-size: 0.9rem;
+                line-height: 1.5;
+            }
+            #result {
+                line-height: 1.7;
+            }
+            .result-intro {
+                margin: 10px 0 14px;
+                color: #555;
+                font-size: 0.9rem;
+            }
+            .fortune-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+                gap: 10px;
+                margin: 12px 0;
+            }
+            .fortune-card {
+                padding: 13px;
+                border: 1px solid #e2e5e9;
+                border-radius: 10px;
+                background: #fbfcfd;
+            }
+            .fortune-card h3 {
+                margin: 0 0 7px;
+                font-size: 0.98rem;
+            }
+            .fortune-value {
+                margin: 2px 0 6px;
+                font-size: 1.18rem;
+                font-weight: 700;
+                color: #174f43;
+            }
+            .fortune-detail {
+                margin: 0;
+                color: #555;
+                font-size: 0.9rem;
+            }
+            .fortune-note {
+                margin-top: 12px;
+                color: #777;
+                font-size: 0.82rem;
+            }
+            video {
+                display: none;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>얼굴 간단 분석</h1>
+        <p class="note">
+            사진을 선택하거나 웹캠으로 찍어 보세요. 얼굴 랜드마크를 바탕으로
+            표정 신호와 전통 관상학의 삼정·얼굴 비율을 참고한 직업군 및 수명운
+            풀이를 표시합니다.
+        </p>
+
+        <div class="controls">
+            <input id="fileInput" type="file" accept="image/*" />
+            <div>
+                <button id="startCamera">웹캠 켜기</button>
+                <button id="takePhoto" disabled>사진 찍고 분석</button>
+                <button id="stopCamera" disabled>웹캠 끄기</button>
+            </div>
+            <p id="status">사진을 선택하거나 웹캠을 켜세요.</p>
+        </div>
+
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+
+        <div class="panel">
+            <strong>분석 결과</strong>
+            <p id="result">아직 분석한 사진이 없습니다.</p>
+        </div>
+
+        <script type="module">
+            import {
+                FaceLandmarker,
+                FilesetResolver,
+            } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/+esm";
+
+            const MODEL_URL =
+                "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+            const WASM_URL =
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm";
+
+            const fileInput = document.querySelector("#fileInput");
+            const video = document.querySelector("#video");
+            const canvas = document.querySelector("#canvas");
+            const ctx = canvas.getContext("2d");
+            const statusEl = document.querySelector("#status");
+            const resultEl = document.querySelector("#result");
+            const startCameraBtn = document.querySelector("#startCamera");
+            const takePhotoBtn = document.querySelector("#takePhoto");
+            const stopCameraBtn = document.querySelector("#stopCamera");
+
+            let landmarker = null;
+            let cameraStream = null;
+            let busy = false;
+
+            async function getLandmarker() {
+                if (landmarker) return landmarker;
+
+                statusEl.textContent = "분석 모델을 불러오는 중…";
+                const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+                landmarker = await FaceLandmarker.createFromOptions(vision, {
+                    baseOptions: { modelAssetPath: MODEL_URL },
+                    runningMode: "IMAGE",
+                    numFaces: 1,
+                    outputFaceBlendshapes: true,
+                });
+                return landmarker;
+            }
+
+            function drawImageToCanvas(source) {
+                const width =
+                    source.videoWidth || source.naturalWidth || source.width;
+                const height =
+                    source.videoHeight || source.naturalHeight || source.height;
+                const scale = Math.min(1, 1280 / width, 1280 / height);
+
+                canvas.width = Math.max(1, Math.round(width * scale));
+                canvas.height = Math.max(1, Math.round(height * scale));
+                ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+            }
+
+            function getBlendshapeScore(categories, name) {
+                return (
+                    categories.find((item) => item.categoryName === name)
+                        ?.score ?? 0
+                );
+            }
+
+            function percent(value) {
+                return `${Math.round(value * 100)}%`;
+            }
+
+            function summarizeExpressions(categories) {
+                const smile =
+                    (getBlendshapeScore(categories, "mouthSmileLeft") +
+                        getBlendshapeScore(categories, "mouthSmileRight")) /
+                    2;
+                const jawOpen = getBlendshapeScore(categories, "jawOpen");
+                const blink =
+                    (getBlendshapeScore(categories, "eyeBlinkLeft") +
+                        getBlendshapeScore(categories, "eyeBlinkRight")) /
+                    2;
+                const browUp = getBlendshapeScore(categories, "browInnerUp");
+
+                const signals = [];
+                if (smile >= 0.45)
+                    signals.push("미소 관련 움직임이 비교적 뚜렷함");
+                else if (smile >= 0.2) signals.push("약한 미소 관련 신호");
+                if (jawOpen >= 0.45) signals.push("입을 벌린 신호");
+                if (blink >= 0.55) signals.push("눈을 감은 신호");
+                if (browUp >= 0.45) signals.push("눈썹을 올린 신호");
+                if (signals.length === 0)
+                    signals.push("뚜렷한 표정 신호가 크지 않음");
+
+                return [
+                    `미소 신호: ${percent(smile)}`,
+                    `입 벌림 신호: ${percent(jawOpen)}`,
+                    `눈 감김 신호: ${percent(blink)}`,
+                    `눈썹 올림 신호: ${percent(browUp)}`,
+                    "",
+                    `간단 요약: ${signals.join(", ")}`,
+                ].join("\n");
+            }
+
+            // MediaPipe 얼굴 랜드마크를 전통 관상학의 삼정·인중·턱 비율에
+            // 대응시킨 오락용 풀이입니다. 얼굴에서 실제 직업이나 수명을 판정하지 않습니다.
+            function getPoint(landmarks, index) {
+                const point = landmarks[index];
+                if (!point)
+                    throw new Error(
+                        `필요한 얼굴 랜드마크(${index})를 찾지 못했습니다.`,
+                    );
+                return point;
+            }
+
+            function verticalDistance(landmarks, a, b) {
+                return Math.abs(
+                    getPoint(landmarks, a).y - getPoint(landmarks, b).y,
+                );
+            }
+
+            function horizontalDistance(landmarks, a, b) {
+                return Math.abs(
+                    getPoint(landmarks, a).x - getPoint(landmarks, b).x,
+                );
+            }
+
+            function clamp(value, min, max) {
+                return Math.min(max, Math.max(min, value));
+            }
+
+            function analyzePhysiognomy(landmarks) {
+                // 삼정의 경계는 얼굴 랜드마크로 근사합니다.
+                // 10: 이마 위쪽, 168: 미간 부근, 1: 코끝, 152: 턱끝
+                const faceHeight = verticalDistance(landmarks, 10, 152);
+                if (!Number.isFinite(faceHeight) || faceHeight <= 0) {
+                    throw new Error("얼굴 비율을 계산할 수 없습니다.");
+                }
+
+                const upper = verticalDistance(landmarks, 10, 168) / faceHeight;
+                const middle = verticalDistance(landmarks, 168, 1) / faceHeight;
+                const lower = verticalDistance(landmarks, 1, 152) / faceHeight;
+                const total = upper + middle + lower || 1;
+                const thirds = [upper / total, middle / total, lower / total];
+                const [upperShare, middleShare, lowerShare] = thirds;
+
+                const cheekWidth = horizontalDistance(landmarks, 234, 454);
+                const jawWidth = horizontalDistance(landmarks, 172, 397);
+                const faceWidth = horizontalDistance(landmarks, 127, 356);
+                const faceRatio = faceWidth / faceHeight;
+                const jawRatio = cheekWidth > 0 ? jawWidth / cheekWidth : 0;
+                const philtrumRatio =
+                    verticalDistance(landmarks, 2, 13) / faceHeight;
+
+                let faceType = "균형형 얼굴 비율";
+                if (faceRatio >= 0.82) faceType = "가로 폭이 도드라지는 얼굴형";
+                else if (faceRatio <= 0.68)
+                    faceType = "세로 길이가 도드라지는 얼굴형";
+
+                const maxThird = Math.max(...thirds);
+                let dominantThird = "삼정 균형형";
+                if (maxThird - Math.min(...thirds) < 0.055) {
+                    dominantThird = "상·중·하 삼정이 비교적 고른 형";
+                } else if (maxThird === upperShare) {
+                    dominantThird = "상정(이마 부위)이 도드라지는 형";
+                } else if (maxThird === middleShare) {
+                    dominantThird = "중정(눈·코 부위)이 도드라지는 형";
+                } else {
+                    dominantThird = "하정(입·턱 부위)이 도드라지는 형";
+                }
+
+                let career;
+                let reading;
+                if (dominantThird.includes("상정")) {
+                    career = "연구·기획·교육·전략 분야";
+                    reading =
+                        "전통 풀이에서는 상정을 지혜와 초년의 기운에 비유합니다. 생각을 정리하고 지식을 다루는 역할로 연결한 해석입니다.";
+                } else if (dominantThird.includes("중정")) {
+                    career = "영업·협상·상담·대외협력 분야";
+                    reading =
+                        "중정은 사회적 활동과 대인 관계의 흐름에 비유됩니다. 사람과 정보를 연결하는 역할로 풀이했습니다.";
+                } else if (dominantThird.includes("하정")) {
+                    career = "경영·운영·조직관리·사업 분야";
+                    reading =
+                        "하정은 전통 풀이에서 말년의 안정과 실행력에 비유됩니다. 일을 마무리하고 운영하는 역할로 연결했습니다.";
+                } else if (jawRatio >= 0.78) {
+                    career = "조직관리·운영·현장 리더십 분야";
+                    reading =
+                        "삼정의 균형에 턱의 존재감을 더해, 추진과 관리 중심의 직업군으로 풀이했습니다.";
+                } else if (faceType.includes("세로")) {
+                    career = "창작·콘텐츠·디자인·연구 분야";
+                    reading =
+                        "삼정이 크게 치우치지 않은 형으로 보고, 집중과 표현을 활용하는 역할로 연결했습니다.";
+                } else {
+                    career = "기획·행정·전문직·컨설팅 분야";
+                    reading =
+                        "삼정의 균형을 조정과 종합의 상징으로 읽어, 여러 정보를 다루는 역할로 풀이했습니다.";
+                }
+
+                // 전통 관상에서 인중·하정·턱을 장수운의 상징으로 보는 풀이를
+                // 간단한 점수 연출로 변환합니다. 실제 기대수명 계산식이 아닙니다.
+                const philtrumSignal = clamp(
+                    (philtrumRatio - 0.018) / 0.045,
+                    0,
+                    1,
+                );
+                const lowerBalance =
+                    1 - Math.min(1, Math.abs(lowerShare - 0.34) / 0.24);
+                const jawSignal = clamp((jawRatio - 0.55) / 0.38, 0, 1);
+                const longevityScore = Math.round(
+                    45 * philtrumSignal + 35 * lowerBalance + 20 * jawSignal,
+                );
+                const ageCenter = Math.round(80 + longevityScore * 0.12);
+                const ageLow = ageCenter - 3;
+                const ageHigh = ageCenter + 3;
+
+                return {
+                    faceType,
+                    dominantThird,
+                    upperShare,
+                    middleShare,
+                    lowerShare,
+                    career,
+                    reading,
+                    ageLow,
+                    ageHigh,
+                    philtrumPercent: philtrumRatio * 100,
+                };
+            }
+
+            function renderResult(landmarks, categories) {
+                const reading = analyzePhysiognomy(landmarks);
+                const expressionText = summarizeExpressions(categories);
+                const pct = (value) => `${Math.round(value * 100)}%`;
+
+                resultEl.innerHTML = `
+                    <p><strong>얼굴 감지:</strong> 성공 · 랜드마크 ${landmarks.length}개</p>
+                    <div class="fortune-grid">
+                        <section class="fortune-card">
+                            <h3>예상 직업군</h3>
+                            <p class="fortune-value">${reading.career}</p>
+                            <p class="fortune-detail">${reading.reading}</p>
+                        </section>
+                        <section class="fortune-card">
+                            <h3>관상식 예상 수명</h3>
+                            <p class="fortune-value">${reading.ageLow}~${reading.ageHigh}세</p>
+                            <p class="fortune-detail">인중·하정·턱 비율을 활용해 만든 장수운 점괘</p>
+                        </section>
+                        <section class="fortune-card">
+                            <h3>얼굴형 풀이</h3>
+                            <p class="fortune-value">${reading.faceType}</p>
+                            <p class="fortune-detail">${reading.dominantThird}</p>
+                        </section>
+                        <section class="fortune-card">
+                            <h3>삼정 비율</h3>
+                            <p class="fortune-detail">상정 ${pct(reading.upperShare)} · 중정 ${pct(reading.middleShare)} · 하정 ${pct(reading.lowerShare)}</p>
+                            <p class="fortune-detail">인중 비율(얼굴 높이 대비): ${reading.philtrumPercent.toFixed(1)}%</p>
+                        </section>
+                    </div>
+                    <h3>표정 신호</h3>
+                    <p style="white-space:pre-line">${expressionText}</p>
+                    <p class="fortune-note">※ 전통 관상학의 상징 풀이를 얼굴 랜드마크에 단순 적용한 오락용 결과입니다. 직업 적성이나 실제 수명을 예측하는 과학적 분석은 아닙니다.</p>
+                `;
+            }
+
+            async function analyze(source) {
+                if (busy) return;
+                busy = true;
+                fileInput.disabled = true;
+                takePhotoBtn.disabled = true;
+
+                try {
+                    const model = await getLandmarker();
+                    drawImageToCanvas(source);
+
+                    statusEl.textContent = "얼굴을 분석하는 중…";
+                    const detection = model.detect(canvas);
+
+                    if (!detection.faceLandmarks?.length) {
+                        resultEl.textContent =
+                            "얼굴을 찾지 못했어요. 얼굴이 잘 보이도록 사진을 다시 찍어 보세요.";
+                        statusEl.textContent = "분석이 끝났습니다.";
+                        return;
+                    }
+
+                    const landmarks = detection.faceLandmarks[0];
+
+                    // 얼굴의 대략적인 위치를 표시합니다.
+                    const xs = landmarks.map((point) => point.x * canvas.width);
+                    const ys = landmarks.map(
+                        (point) => point.y * canvas.height,
+                    );
+                    const left = Math.min(...xs);
+                    const right = Math.max(...xs);
+                    const top = Math.min(...ys);
+                    const bottom = Math.max(...ys);
+
+                    ctx.strokeStyle = "#00a86b";
+                    ctx.lineWidth = Math.max(2, canvas.width / 350);
+                    ctx.strokeRect(left, top, right - left, bottom - top);
+
+                    // 랜드마크 점을 표시합니다.
+                    ctx.fillStyle = "#ff3b30";
+                    const radius = Math.max(1, canvas.width / 500);
+                    for (const point of landmarks) {
+                        ctx.beginPath();
+                        ctx.arc(
+                            point.x * canvas.width,
+                            point.y * canvas.height,
+                            radius,
+                            0,
+                            Math.PI * 2,
+                        );
+                        ctx.fill();
+                    }
+
+                    const categories =
+                        detection.faceBlendshapes?.[0]?.categories ?? [];
+                    renderResult(landmarks, categories);
+
+                    statusEl.textContent = "분석이 끝났습니다.";
+                } catch (error) {
+                    console.error(error);
+                    statusEl.textContent = "오류가 발생했습니다.";
+                    resultEl.textContent =
+                        "모델을 불러오거나 분석하지 못했어요. 인터넷 연결과 브라우저를 확인해 주세요.";
+                } finally {
+                    busy = false;
+                    fileInput.disabled = false;
+                    takePhotoBtn.disabled = !cameraStream;
+                }
+            }
+
+            fileInput.addEventListener("change", async () => {
+                const file = fileInput.files?.[0];
+                if (!file) return;
+
+                const image = new Image();
+                image.onload = () => {
+                    analyze(image);
+                    URL.revokeObjectURL(image.src);
+                };
+                image.onerror = () => {
+                    statusEl.textContent = "이미지를 열지 못했습니다.";
+                    URL.revokeObjectURL(image.src);
+                };
+                image.src = URL.createObjectURL(file);
+            });
+
+            startCameraBtn.addEventListener("click", async () => {
+                try {
+                    cameraStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: "user" },
+                        audio: false,
+                    });
+                    video.srcObject = cameraStream;
+                    await video.play();
+
+                    takePhotoBtn.disabled = false;
+                    stopCameraBtn.disabled = false;
+                    statusEl.textContent =
+                        "웹캠이 켜졌습니다. 사진 찍기를 누르세요.";
+                } catch (error) {
+                    console.error(error);
+                    statusEl.textContent =
+                        "웹캠을 열지 못했습니다. 브라우저 권한과 HTTPS 또는 localhost 여부를 확인해 주세요.";
+                }
+            });
+
+            takePhotoBtn.addEventListener("click", () => {
+                if (video.readyState >= 2) analyze(video);
+            });
+
+            stopCameraBtn.addEventListener("click", () => {
+                cameraStream?.getTracks().forEach((track) => track.stop());
+                cameraStream = null;
+                video.srcObject = null;
+                takePhotoBtn.disabled = true;
+                stopCameraBtn.disabled = true;
+                statusEl.textContent = "웹캠을 껐습니다.";
+            });
+        </script>
+    </body>
 </html>
